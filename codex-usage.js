@@ -6,6 +6,7 @@ const path = require("path");
 const readline = require("readline");
 
 const DEFAULT_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
+const JETBRAINS_CACHE_DIR = path.join(os.homedir(), ".cache", "JetBrains");
 
 // USD per 1M tokens. Update here if your account uses a different tier.
 // Source checked 2026-06-18: https://developers.openai.com/api/docs/pricing
@@ -21,11 +22,13 @@ const PRICES = {
 };
 
 function usage(exitCode = 0) {
-  console.log(`Usage: node codex-usage.js [--months N] [sessions-dir]
+  console.log(`Usage: node codex-usage.js [--months N] [sessions-dir ...]
 
 Reads Codex JSONL session history and prints monthly token/cost totals.
 Defaults to the latest 3 months.
-Default sessions-dir: ${DEFAULT_SESSIONS_DIR}
+Default session dirs:
+  ${DEFAULT_SESSIONS_DIR}
+  ${path.join(JETBRAINS_CACHE_DIR, "*", "aia", "codex", "sessions")}
 `);
   process.exit(exitCode);
 }
@@ -34,7 +37,7 @@ function parseArgs(argv) {
   if (argv.includes("-h") || argv.includes("--help")) usage(0);
 
   let months = 3;
-  let sessionsDir = DEFAULT_SESSIONS_DIR;
+  let sessionsDirs = [];
   const positional = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -54,9 +57,8 @@ function parseArgs(argv) {
     positional.push(arg);
   }
 
-  if (positional.length > 1) usage(1);
-  if (positional[0]) sessionsDir = expandHome(positional[0]);
-  return { sessionsDir, months };
+  sessionsDirs = positional.length ? positional.map(expandHome) : discoverDefaultSessionDirs();
+  return { sessionsDirs, months };
 }
 
 function parsePositiveInteger(value, label) {
@@ -74,12 +76,14 @@ function expandHome(value) {
 }
 
 async function main() {
-  const { sessionsDir, months: maxMonths } = parseArgs(process.argv.slice(2));
-  if (!fs.existsSync(sessionsDir)) {
-    throw new Error(`Session directory not found: ${sessionsDir}`);
+  const { sessionsDirs, months: maxMonths } = parseArgs(process.argv.slice(2));
+  for (const sessionsDir of sessionsDirs) {
+    if (!fs.existsSync(sessionsDir)) {
+      throw new Error(`Session directory not found: ${sessionsDir}`);
+    }
   }
 
-  const files = listJsonlFiles(sessionsDir);
+  const files = listJsonlFiles(sessionsDirs);
   const byModelMonth = new Map();
   const months = new Set();
   const unpricedModels = new Set();
@@ -102,12 +106,41 @@ async function main() {
     });
   }
 
-  printReport(byModelMonth, [...months].sort().slice(-maxMonths), unpricedModels, sessionsDir, files.length);
+  printReport(byModelMonth, [...months].sort().slice(-maxMonths), unpricedModels);
 }
 
-function listJsonlFiles(root) {
+function discoverDefaultSessionDirs() {
+  const dirs = [];
+  if (fs.existsSync(DEFAULT_SESSIONS_DIR)) dirs.push(DEFAULT_SESSIONS_DIR);
+
+  if (fs.existsSync(JETBRAINS_CACHE_DIR)) {
+    for (const entry of fs.readdirSync(JETBRAINS_CACHE_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const sessionsDir = path.join(JETBRAINS_CACHE_DIR, entry.name, "aia", "codex", "sessions");
+      if (fs.existsSync(sessionsDir)) dirs.push(sessionsDir);
+    }
+  }
+
+  return dedupePaths(dirs);
+}
+
+function dedupePaths(paths) {
+  const seen = new Set();
+  const result = [];
+
+  for (const candidate of paths) {
+    const key = fs.existsSync(candidate) ? fs.realpathSync(candidate) : path.resolve(candidate);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(candidate);
+  }
+
+  return result;
+}
+
+function listJsonlFiles(roots) {
   const files = [];
-  const stack = [root];
+  const stack = [...roots];
 
   while (stack.length) {
     const dir = stack.pop();
@@ -221,9 +254,9 @@ function calculateCost(usage, price) {
   );
 }
 
-function printReport(byModelMonth, months, unpricedModels, sessionsDir, fileCount) {
+function printReport(byModelMonth, months, unpricedModels) {
   if (!months.length) {
-    console.log(`No token usage found in ${sessionsDir}`);
+    console.log("No token usage found.");
     return;
   }
 
