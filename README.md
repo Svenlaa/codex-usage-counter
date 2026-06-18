@@ -19,6 +19,12 @@ history:
 ./codex-usage.js
 ```
 
+Or with pnpm:
+
+```bash
+pnpm start
+```
+
 Show more history:
 
 ```bash

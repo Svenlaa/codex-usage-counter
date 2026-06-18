@@ -1,6 +1,7 @@
 {
   "name": "codex-usage-counter",
   "version": "1.0.0",
+  "packageManager": "pnpm@11.1.1",
   "type": "module",
   "bin": {
     "codex-usage": "./codex-usage.js"

@@ -59,6 +59,8 @@ function parseArgs(args) {
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
 
+    if (arg === "--") continue;
+
     if (arg === "--months" || arg === "-m") {
       options.months = parsePositiveInteger(args[++index], "--months");
       continue;
