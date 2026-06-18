@@ -1,5 +1,7 @@
 # Codex Usage Counter
 
+This is an AI-built utility repo created with Codex.
+
 Small Node.js script that reads local Codex session history from `~/.codex/sessions`,
 groups usage by month, and estimates API cost per model.
 
