@@ -1,0 +1,12 @@
+{
+  "name": "codex-usage-counter",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "codex-usage": "./codex-usage.js"
+  },
+  "scripts": {
+    "check": "node --check codex-usage.js",
+    "start": "node codex-usage.js"
+  }
+}

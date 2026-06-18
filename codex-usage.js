@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const readline = require("readline");
+import fs from "node:fs";
+import { readdir } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import readline from "node:readline";
 
-const DEFAULT_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
-const JETBRAINS_CACHE_DIR = path.join(os.homedir(), ".cache", "JetBrains");
+const HOME = os.homedir();
+const DEFAULT_MONTHS = 3;
+const DEFAULT_SESSIONS_DIR = path.join(HOME, ".codex", "sessions");
+const JETBRAINS_CACHE_DIR = path.join(HOME, ".cache", "JetBrains");
 
 // USD per 1M tokens. Update here if your account uses a different tier.
 // Source checked 2026-06-18: https://developers.openai.com/api/docs/pricing
-const PRICES = {
+const PRICES = Object.freeze({
   "gpt-5.5": { input: 5.0, cachedInput: 0.5, output: 30.0 },
   "gpt-5.4": { input: 2.5, cachedInput: 0.25, output: 15.0 },
   "gpt-5.3-codex": { input: 1.75, cachedInput: 0.175, output: 14.0 },
@@ -19,46 +22,70 @@ const PRICES = {
   // Keep these explicit so the estimate remains useful and easy to override.
   "gpt-5.2-codex": { input: 1.75, cachedInput: 0.175, output: 14.0 },
   "gpt-5-codex": { input: 1.25, cachedInput: 0.125, output: 10.0 },
-};
+});
 
-function usage(exitCode = 0) {
+const moneyFormatter = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exit(1);
+});
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const sessionDirs = options.sessionDirs.length ? options.sessionDirs : await discoverDefaultSessionDirs();
+  await validateSessionDirs(sessionDirs, options.sessionDirs.length > 0);
+
+  const files = await listJsonlFiles(sessionDirs);
+  const report = await buildUsageReport(files);
+  const months = [...report.months].sort().slice(-options.months);
+
+  printReport(report, months);
+}
+
+function parseArgs(args) {
+  if (args.includes("-h") || args.includes("--help")) printUsageAndExit(0);
+
+  const options = {
+    months: DEFAULT_MONTHS,
+    sessionDirs: [],
+  };
+
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+
+    if (arg === "--months" || arg === "-m") {
+      options.months = parsePositiveInteger(args[++index], "--months");
+      continue;
+    }
+
+    if (arg.startsWith("--months=")) {
+      options.months = parsePositiveInteger(arg.slice("--months=".length), "--months");
+      continue;
+    }
+
+    if (arg.startsWith("-")) printUsageAndExit(1);
+    options.sessionDirs.push(expandHome(arg));
+  }
+
+  return options;
+}
+
+function printUsageAndExit(exitCode) {
   console.log(`Usage: node codex-usage.js [--months N] [sessions-dir ...]
 
 Reads Codex JSONL session history and prints monthly token/cost totals.
-Defaults to the latest 3 months.
+Defaults to the latest ${DEFAULT_MONTHS} months.
 Default session dirs:
   ${DEFAULT_SESSIONS_DIR}
   ${path.join(JETBRAINS_CACHE_DIR, "*", "aia", "codex", "sessions")}
 `);
   process.exit(exitCode);
-}
-
-function parseArgs(argv) {
-  if (argv.includes("-h") || argv.includes("--help")) usage(0);
-
-  let months = 3;
-  let sessionsDirs = [];
-  const positional = [];
-
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--months" || arg === "-m") {
-      const value = argv[++i];
-      months = parsePositiveInteger(value, "--months");
-      continue;
-    }
-
-    if (arg.startsWith("--months=")) {
-      months = parsePositiveInteger(arg.slice("--months=".length), "--months");
-      continue;
-    }
-
-    if (arg.startsWith("-")) usage(1);
-    positional.push(arg);
-  }
-
-  sessionsDirs = positional.length ? positional.map(expandHome) : discoverDefaultSessionDirs();
-  return { sessionsDirs, months };
 }
 
 function parsePositiveInteger(value, label) {
@@ -70,81 +97,73 @@ function parsePositiveInteger(value, label) {
 }
 
 function expandHome(value) {
-  if (value === "~") return os.homedir();
-  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
+  if (value === "~") return HOME;
+  if (value.startsWith("~/")) return path.join(HOME, value.slice(2));
   return value;
 }
 
-async function main() {
-  const { sessionsDirs, months: maxMonths } = parseArgs(process.argv.slice(2));
-  for (const sessionsDir of sessionsDirs) {
-    if (!fs.existsSync(sessionsDir)) {
-      throw new Error(`Session directory not found: ${sessionsDir}`);
-    }
+async function discoverDefaultSessionDirs() {
+  const candidates = [DEFAULT_SESSIONS_DIR];
+
+  if (await pathExists(JETBRAINS_CACHE_DIR)) {
+    const products = await readdir(JETBRAINS_CACHE_DIR, { withFileTypes: true });
+    candidates.push(
+      ...products
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(JETBRAINS_CACHE_DIR, entry.name, "aia", "codex", "sessions")),
+    );
   }
 
-  const files = listJsonlFiles(sessionsDirs);
-  const byModelMonth = new Map();
-  const months = new Set();
-  const unpricedModels = new Set();
-
-  for (const file of files) {
-    await readSessionFile(file, (entry) => {
-      const { model, month, usage } = entry;
-      months.add(month);
-      const bucket = getBucket(byModelMonth, model, month);
-      bucket.input += usage.input_tokens;
-      bucket.cachedInput += usage.cached_input_tokens;
-      bucket.output += usage.output_tokens;
-
-      const price = PRICES[model];
-      if (price) {
-        bucket.cost += calculateCost(usage, price);
-      } else {
-        unpricedModels.add(model);
-      }
-    });
-  }
-
-  printReport(byModelMonth, [...months].sort().slice(-maxMonths), unpricedModels);
+  return dedupePaths(await filterExistingPaths(candidates));
 }
 
-function discoverDefaultSessionDirs() {
-  const dirs = [];
-  if (fs.existsSync(DEFAULT_SESSIONS_DIR)) dirs.push(DEFAULT_SESSIONS_DIR);
+async function filterExistingPaths(paths) {
+  const existing = await Promise.all(
+    paths.map(async (candidate) => ((await pathExists(candidate)) ? candidate : null)),
+  );
+  return existing.filter(Boolean);
+}
 
-  if (fs.existsSync(JETBRAINS_CACHE_DIR)) {
-    for (const entry of fs.readdirSync(JETBRAINS_CACHE_DIR, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const sessionsDir = path.join(JETBRAINS_CACHE_DIR, entry.name, "aia", "codex", "sessions");
-      if (fs.existsSync(sessionsDir)) dirs.push(sessionsDir);
-    }
+async function validateSessionDirs(sessionDirs, throwOnMissing) {
+  const missing = [];
+
+  for (const sessionDir of sessionDirs) {
+    if (!(await pathExists(sessionDir))) missing.push(sessionDir);
   }
 
-  return dedupePaths(dirs);
+  if (missing.length && throwOnMissing) {
+    throw new Error(`Session directory not found: ${missing.join(", ")}`);
+  }
+}
+
+async function pathExists(candidate) {
+  try {
+    await fs.promises.access(candidate);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function dedupePaths(paths) {
   const seen = new Set();
-  const result = [];
-
-  for (const candidate of paths) {
-    const key = fs.existsSync(candidate) ? fs.realpathSync(candidate) : path.resolve(candidate);
-    if (seen.has(key)) continue;
+  return paths.filter((candidate) => {
+    const key = fs.realpathSync(candidate);
+    if (seen.has(key)) return false;
     seen.add(key);
-    result.push(candidate);
-  }
-
-  return result;
+    return true;
+  });
 }
 
-function listJsonlFiles(roots) {
+async function listJsonlFiles(roots) {
   const files = [];
   const stack = [...roots];
 
   while (stack.length) {
     const dir = stack.pop();
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const entries = await readdir(dir, { withFileTypes: true });
+
+    for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) stack.push(fullPath);
       if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(fullPath);
@@ -154,62 +173,87 @@ function listJsonlFiles(roots) {
   return files.sort();
 }
 
-async function readSessionFile(file, onUsage) {
+async function buildUsageReport(files) {
+  const report = {
+    byModelMonth: new Map(),
+    months: new Set(),
+    unpricedModels: new Set(),
+  };
+
+  for (const file of files) {
+    for await (const entry of readSessionUsage(file)) {
+      addUsage(report, entry);
+    }
+  }
+
+  return report;
+}
+
+async function* readSessionUsage(file) {
   let currentModel = "unknown";
   let previousTotal = null;
-  const monthFromPath = inferMonthFromPath(file);
+  const fallbackMonth = inferMonthFromPath(file);
 
-  const rl = readline.createInterface({
+  const lines = readline.createInterface({
     input: fs.createReadStream(file, { encoding: "utf8" }),
     crlfDelay: Infinity,
   });
 
-  for await (const line of rl) {
-    if (!line.trim()) continue;
+  for await (const line of lines) {
+    const record = parseJsonLine(line);
+    if (!record) continue;
 
-    let record;
-    try {
-      record = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
-    const payload = record.payload || {};
+    const payload = record.payload ?? {};
     if (record.type === "turn_context" && payload.model) {
-      currentModel = payload.model;
+      currentModel = normalizeModelName(payload.model);
       continue;
     }
 
     if (record.type !== "event_msg" || payload.type !== "token_count") continue;
-    const total = normalizeUsage(payload.info && payload.info.total_token_usage);
+
+    const total = normalizeUsage(payload.info?.total_token_usage);
     if (!total) continue;
 
-    const delta = previousTotal ? usageDelta(previousTotal, total) : total;
+    const usage = previousTotal ? usageDelta(previousTotal, total) : total;
     previousTotal = total;
-    if (isZeroUsage(delta)) continue;
+    if (isZeroUsage(usage)) continue;
 
-    onUsage({
+    yield {
       model: currentModel,
-      month: monthFromTimestamp(record.timestamp) || monthFromPath || "unknown",
-      usage: delta,
-    });
+      month: monthFromTimestamp(record.timestamp) ?? fallbackMonth ?? "unknown",
+      usage,
+    };
   }
+}
+
+function parseJsonLine(line) {
+  if (!line.trim()) return null;
+
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeModelName(model) {
+  return String(model).replace(/\[(?:low|medium|high|xhigh)\]$/, "");
 }
 
 function normalizeUsage(usage) {
   if (!usage) return null;
   return {
-    input_tokens: numberOrZero(usage.input_tokens),
-    cached_input_tokens: numberOrZero(usage.cached_input_tokens),
-    output_tokens: numberOrZero(usage.output_tokens),
+    inputTokens: numberOrZero(usage.input_tokens),
+    cachedInputTokens: numberOrZero(usage.cached_input_tokens),
+    outputTokens: numberOrZero(usage.output_tokens),
   };
 }
 
 function usageDelta(previous, current) {
   return {
-    input_tokens: Math.max(0, current.input_tokens - previous.input_tokens),
-    cached_input_tokens: Math.max(0, current.cached_input_tokens - previous.cached_input_tokens),
-    output_tokens: Math.max(0, current.output_tokens - previous.output_tokens),
+    inputTokens: Math.max(0, current.inputTokens - previous.inputTokens),
+    cachedInputTokens: Math.max(0, current.cachedInputTokens - previous.cachedInputTokens),
+    outputTokens: Math.max(0, current.outputTokens - previous.outputTokens),
   };
 }
 
@@ -218,146 +262,141 @@ function numberOrZero(value) {
 }
 
 function isZeroUsage(usage) {
-  return usage.input_tokens === 0 && usage.cached_input_tokens === 0 && usage.output_tokens === 0;
+  return usage.inputTokens === 0 && usage.cachedInputTokens === 0 && usage.outputTokens === 0;
 }
 
 function monthFromTimestamp(timestamp) {
-  if (typeof timestamp !== "string" || timestamp.length < 7) return null;
-  const match = timestamp.match(/^(\d{4})-(\d{2})/);
-  return match ? `${match[1]}-${match[2]}` : null;
+  return typeof timestamp === "string" ? timestamp.match(/^(\d{4})-(\d{2})/)?.slice(1, 3).join("-") : null;
 }
 
 function inferMonthFromPath(file) {
   const parts = file.split(path.sep);
-  for (let i = 0; i < parts.length - 1; i++) {
-    if (/^\d{4}$/.test(parts[i]) && /^\d{2}$/.test(parts[i + 1])) {
-      return `${parts[i]}-${parts[i + 1]}`;
-    }
+  const yearIndex = parts.findIndex((part, index) => /^\d{4}$/.test(part) && /^\d{2}$/.test(parts[index + 1] ?? ""));
+  return yearIndex === -1 ? null : `${parts[yearIndex]}-${parts[yearIndex + 1]}`;
+}
+
+function addUsage(report, { model, month, usage }) {
+  report.months.add(month);
+  const bucket = getBucket(report.byModelMonth, model, month);
+
+  bucket.inputTokens += usage.inputTokens;
+  bucket.cachedInputTokens += usage.cachedInputTokens;
+  bucket.outputTokens += usage.outputTokens;
+
+  const price = PRICES[model];
+  if (price) {
+    bucket.cost += calculateCost(usage, price);
+  } else {
+    report.unpricedModels.add(model);
   }
-  return null;
 }
 
 function getBucket(map, model, month) {
-  const key = `${model}\0${month}`;
+  const key = bucketKey(model, month);
   if (!map.has(key)) {
-    map.set(key, { model, month, input: 0, cachedInput: 0, output: 0, cost: 0 });
+    map.set(key, { model, month, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, cost: 0 });
   }
   return map.get(key);
 }
 
-function calculateCost(usage, price) {
-  const cached = Math.min(usage.cached_input_tokens, usage.input_tokens);
-  const uncached = usage.input_tokens - cached;
-  return (
-    (uncached * price.input + cached * price.cachedInput + usage.output_tokens * price.output) /
-    1_000_000
-  );
+function bucketKey(model, month) {
+  return `${model}\0${month}`;
 }
 
-function printReport(byModelMonth, months, unpricedModels) {
+function calculateCost(usage, price) {
+  const cached = Math.min(usage.cachedInputTokens, usage.inputTokens);
+  const uncached = usage.inputTokens - cached;
+  return (uncached * price.input + cached * price.cachedInput + usage.outputTokens * price.output) / 1_000_000;
+}
+
+function printReport(report, months) {
   if (!months.length) {
     console.log("No token usage found.");
     return;
   }
 
-  const models = [...new Set([...byModelMonth.values()].map((bucket) => bucket.model))].sort();
-  const rows = months.map((month) => makeMonthCostRow(byModelMonth, models, month));
-  rows.push(makeGrandTotalCostRow(byModelMonth, models, months));
-
-  if (unpricedModels.size) {
-    console.log(`Unpriced models counted as $0 cost: ${[...unpricedModels].sort().join(", ")}`);
+  if (report.unpricedModels.size) {
+    console.log(`Unpriced models counted as $0 cost: ${[...report.unpricedModels].sort().join(", ")}`);
     console.log("");
   }
+
+  const models = uniqueModels(report.byModelMonth);
+  const rows = months.map((month) => makeMonthCostRow(report.byModelMonth, models, month));
+  rows.push(makeTotalCostRow(report.byModelMonth, models, months));
   printTable(rows);
 }
 
-function makeMonthCostRow(byModelMonth, models, month) {
-  let totalCost = 0;
-  const modelCosts = [];
-
-  for (const model of models) {
-    const bucket = byModelMonth.get(`${model}\0${month}`) || {};
-    const cost = bucket.cost || 0;
-    if (cost === 0) continue;
-
-    totalCost += cost;
-    modelCosts.push(`${model} -> ${formatMoney(cost)}`);
-  }
-
-  return [month, modelCosts.join("\n") || "-", formatMoney(totalCost)];
+function uniqueModels(byModelMonth) {
+  return [...new Set([...byModelMonth.values()].map(({ model }) => model))].sort();
 }
 
-function makeGrandTotalCostRow(byModelMonth, models, months) {
-  let grandCost = 0;
-  const modelCosts = [];
+function makeMonthCostRow(byModelMonth, models, month) {
+  const costs = models
+    .map((model) => [model, byModelMonth.get(bucketKey(model, month))?.cost ?? 0])
+    .filter(([, cost]) => cost > 0);
+
+  return [month, formatModelCosts(costs), formatMoney(sumCosts(costs))];
+}
+
+function makeTotalCostRow(byModelMonth, models, months) {
   const monthSet = new Set(months);
+  const costs = models
+    .map((model) => [
+      model,
+      [...byModelMonth.values()]
+        .filter((bucket) => bucket.model === model && monthSet.has(bucket.month))
+        .reduce((sum, bucket) => sum + bucket.cost, 0),
+    ])
+    .filter(([, cost]) => cost > 0);
 
-  for (const model of models) {
-    let cost = 0;
-    for (const bucket of byModelMonth.values()) {
-      if (bucket.model !== model) continue;
-      if (!monthSet.has(bucket.month)) continue;
-      cost += bucket.cost;
-    }
-    if (cost === 0) continue;
+  return ["TOTAL", formatModelCosts(costs), formatMoney(sumCosts(costs))];
+}
 
-    grandCost += cost;
-    modelCosts.push(`${model} -> ${formatMoney(cost)}`);
-  }
+function formatModelCosts(costs) {
+  return costs.length ? costs.map(([model, cost]) => `${model} -> ${formatMoney(cost)}`).join("\n") : "-";
+}
 
-  return ["TOTAL", modelCosts.join("\n") || "-", formatMoney(grandCost)];
+function sumCosts(costs) {
+  return costs.reduce((sum, [, cost]) => sum + cost, 0);
 }
 
 function printTable(rows) {
-  const widths = [0, 1, 2].map((index) => {
-    return Math.max(
-      ...rows.flatMap((row) => String(row[index] == null ? "" : row[index]).split("\n").map((line) => line.length)),
-    );
-  });
-
+  const widths = columnWidths(rows);
   const divider = widths.map((width) => "-".repeat(width + 2)).join("+");
+
   rows.forEach((row, index) => {
     if (index > 0) console.log(divider);
-    for (const line of expandMultilineRow(row)) {
-      console.log(formatTableRow(line, widths));
-    }
+    expandMultilineRow(row).forEach((line) => console.log(formatTableRow(line, widths)));
   });
 }
 
+function columnWidths(rows) {
+  return [0, 1, 2].map((index) =>
+    Math.max(...rows.flatMap((row) => splitCell(row[index]).map((line) => line.length))),
+  );
+}
+
 function expandMultilineRow(row) {
-  const columns = row.map((cell) => String(cell == null ? "" : cell).split("\n"));
+  const columns = row.map(splitCell);
   const height = Math.max(...columns.map((column) => column.length));
-  const lines = [];
 
-  for (let i = 0; i < height; i++) {
-    lines.push(columns.map((column) => column[i] || ""));
-  }
+  return Array.from({ length: height }, (_, rowIndex) => columns.map((column) => column[rowIndex] ?? ""));
+}
 
-  return lines;
+function splitCell(cell) {
+  return String(cell ?? "").split("\n");
 }
 
 function formatTableRow(row, widths) {
   return row
     .map((cell, index) => {
-      const value = String(cell == null ? "" : cell);
+      const value = String(cell ?? "");
       const padded = index === 0 ? value.padEnd(widths[index]) : value.padStart(widths[index]);
       return ` ${padded} `;
     })
     .join("|");
 }
 
-function formatTokens(value) {
-  return Math.round(value).toLocaleString("en-US");
-}
-
 function formatMoney(value) {
-  return `$${value.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
+  return moneyFormatter.format(value);
 }
-
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(1);
-});
