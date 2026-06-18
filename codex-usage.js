@@ -355,7 +355,7 @@ function makeTotalCostRow(byModelMonth, models, months) {
 }
 
 function formatModelCosts(costs) {
-  return costs.length ? costs.map(([model, cost]) => `${model} -> ${formatMoney(cost)}`).join("\n") : "-";
+  return costs.length ? costs.map(([model, cost]) => `${model}  ${formatMoney(cost)}`).join("\n") : "-";
 }
 
 function sumCosts(costs) {
