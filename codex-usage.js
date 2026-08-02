@@ -12,8 +12,9 @@ const DEFAULT_SESSIONS_DIR = path.join(HOME, ".codex", "sessions");
 const JETBRAINS_CACHE_DIR = path.join(HOME, ".cache", "JetBrains");
 
 // USD per 1M tokens. Update here if your account uses a different tier.
-// Source checked 2026-06-18: https://developers.openai.com/api/docs/pricing
+// Source checked 2026-08-02: https://developers.openai.com/api/docs/pricing
 const PRICES = Object.freeze({
+  "gpt-5.6-sol": { input: 5.0, cachedInput: 0.5, output: 30.0 },
   "gpt-5.5": { input: 5.0, cachedInput: 0.5, output: 30.0 },
   "gpt-5.4": { input: 2.5, cachedInput: 0.25, output: 15.0 },
   "gpt-5.3-codex": { input: 1.75, cachedInput: 0.175, output: 14.0 },
