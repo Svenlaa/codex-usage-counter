@@ -9,7 +9,16 @@ import readline from "node:readline";
 const HOME = os.homedir();
 const DEFAULT_MONTHS = 3;
 const DEFAULT_SESSIONS_DIR = path.join(HOME, ".codex", "sessions");
-const JETBRAINS_CACHE_DIR = path.join(HOME, ".cache", "JetBrains");
+let JETBRAINS_CACHE_DIR;
+if (os.platform() === "darwin") {
+  JETBRAINS_CACHE_DIR = path.join(HOME, "Library", "Caches", "JetBrains");
+}
+if (os.platform() === "linux") {
+  JETBRAINS_CACHE_DIR = path.join(HOME, ".cache", "JetBrains");
+}
+if (os.platform() === "win32") {
+  JETBRAINS_CACHE_DIR = path.join(HOME, "AppData", "Local", "JetBrains");
+}
 
 // USD per 1M tokens. Update here if your account uses a different tier.
 // Source checked 2026-08-02: https://developers.openai.com/api/docs/pricing
