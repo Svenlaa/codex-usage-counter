@@ -22,8 +22,10 @@ if (os.platform() === "win32") {
 
 // USD per 1M tokens. Update here if your account uses a different tier.
 const PRICES = Object.freeze({
-  // Source checked 2026-09-04: https://developers.openai.com/api/docs/models/gpt-6-astra
+  // Source checked 2026-09-23: https://developers.openai.com/api/docs/pricing
   "gpt-6-astra": { input: 10.0, cachedInput: 1.0, output: 50.0 },
+  "gpt-6-sol": { input: 2.0, cachedInput: 0.2, output: 10.0 },
+  "gpt-6-luna": { input: 0.1, cachedInput: 0.01, output: 0.5 },
 
   // Source checked 2026-08-02: https://developers.openai.com/api/docs/pricing
   "gpt-5.6-sol": { input: 5.0, cachedInput: 0.5, output: 30.0 },
